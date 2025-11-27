@@ -117,9 +117,9 @@ def compute_tile_features(tile_paths, block_size=60, subgrid=4, max_workers=8, c
 
     def process_tile(p):
         try:
-            pil = Image.open(p).convert('RGB')
-            feats, pil_resized, lab_arr = compute_4x4_lab_feature_vectorized(pil, block_size, subgrid=subgrid)
-            return (str(p), feats, pil_resized, lab_arr)
+            pil_full = Image.open(p).convert('RGB')
+            feats, pil_resized, lab_arr = compute_4x4_lab_feature_vectorized(pil_full, block_size, subgrid=subgrid)
+            return (str(p), feats, pil_resized, pil_full, lab_arr)
         except Exception as e:
             print(f"Skipped {p} due to error: {e}", flush=True)
             return None
@@ -130,9 +130,12 @@ def compute_tile_features(tile_paths, block_size=60, subgrid=4, max_workers=8, c
             res = fut.result()
             if res is None:
                 continue
-            path_str, feats, pil_resized, lab_arr = res
+            path_str, feats, pil_resized, pil_full, lab_arr = res
             feats_list.append(feats)
-            tiles_data.append({'path': path_str, 'pil': pil_resized, 'lab': lab_arr})
+            tiles_data.append({'path': path_str,
+                               'pil': pil_resized,
+                               'pil_full': pil_full,
+                               'lab': lab_arr})
             if (i + 1) % 100 == 0 or i == 0:
                 print(f"  processed {i+1}/{len(tile_paths)} tiles", flush=True)
 
@@ -199,69 +202,68 @@ def ann_query(backend_name, index_obj, query_low, topk=20):
 # --------------------------
 # Optimized block-to-tile assignment
 # --------------------------
-def assign_tiles_to_blocks(blocks_feats48, feats48, I, nx, ny, top_k=20, redundancy_radius=3, max_workers=8):
+def assign_tiles_to_blocks(blocks_feats48, feats48, I, nx, ny, top_k=20):
     """
-    Assign tiles to blocks efficiently.
-    blocks_feats48: (num_blocks x 48) Lab features of blocks
-    feats48: (num_tiles x 48) Lab features of tiles
-    I: (num_blocks x top_k) ANN candidate indices per block
-    nx, ny: number of blocks in x and y
-    redundancy_radius: radius around block to check for tile reuse
+    Single-threaded, vectorized assignment that enforces global uniqueness.
+    - blocks_feats48: (num_blocks, 48)
+    - feats48: (num_tiles, 48)
+    - I: (num_blocks, top_k) ANN candidate indices per block (ints; -1 padded allowed)
+    - nx, ny: grid shape (used only for shape consistency)
+    Returns: selection_list (num_blocks,) of tile indices (int)
+    Raises RuntimeError if num_blocks > num_tiles (cannot assign unique tiles).
     """
-    num_blocks = blocks_feats48.shape[0]
-    selected_grid = -np.ones((ny, nx), dtype=int)  # 2D array for redundancy check
-    selection_list = np.zeros(num_blocks, dtype=int)
+    num_blocks = int(blocks_feats48.shape[0])
+    num_tiles = int(feats48.shape[0])
 
-    def process_block(idx):
-        bx = idx % nx
-        by = idx // nx
+    if num_blocks > num_tiles:
+        raise RuntimeError(f"Cannot assign unique tiles: {num_blocks} blocks but only {num_tiles} tiles.")
 
-        candidates = I[idx]
-        candidates = candidates[candidates >= 0]
+    selection_list = -np.ones(num_blocks, dtype=int)
+    used_mask = np.zeros(num_tiles, dtype=bool)  # True = already used
 
-        # Vectorized rerank: compute exact 48-d squared distances
-        candidate_feats = feats48[candidates]            # (topk, 48)
-        diffs = candidate_feats - blocks_feats48[idx]   # broadcast subtraction
-        scores = np.sum(diffs**2, axis=1)
+    # Optional heuristic: order blocks by how "ambiguous" they are (blocks with fewer distinct ANN candidates first).
+    # This reduces the chance of exhausting good matches for difficult blocks.
+    # Build candidate counts (ignoring -1 and duplicates)
+    candidate_sets = [np.unique(I[i][I[i] >= 0]).tolist() for i in range(num_blocks)]
+    block_order = np.argsort([len(s) for s in candidate_sets])  # ascending
 
-        # Redundancy check: remove candidates already used nearby
-        y0 = max(0, by - redundancy_radius)
-        y1 = min(ny, by + redundancy_radius + 1)
-        x0 = max(0, bx - redundancy_radius)
-        x1 = min(nx, bx + redundancy_radius + 1)
-        nearby_tiles = selected_grid[y0:y1, x0:x1].flatten()
-        allowed_mask = np.array([t not in nearby_tiles for t in candidates])
-
-        # Choose best candidate among allowed tiles
-        if allowed_mask.any():
-            best_idx_in_candidates = np.argmin(scores[allowed_mask])
-            best_tile = candidates[allowed_mask][best_idx_in_candidates]
+    for idx in block_order:
+        # vectorized candidate handling
+        raw_cands = I[idx]
+        raw_cands = raw_cands[raw_cands >= 0].astype(int)
+        # filter to unused
+        if raw_cands.size:
+            mask_unused = np.logical_not(used_mask[raw_cands])
+            cands = raw_cands[mask_unused]
         else:
-            # fallback: ignore redundancy
-            best_tile = candidates[np.argmin(scores)]
+            cands = np.array([], dtype=int)
 
-        return idx, best_tile
+        if cands.size == 0:
+            # fallback: pick nearest among *all remaining* unused tiles
+            remaining_idx = np.nonzero(~used_mask)[0]
+            if remaining_idx.size == 0:
+                # should not happen due to check above
+                raise RuntimeError("Ran out of unused tiles unexpectedly.")
+            # compute distances to all remaining (vectorized)
+            diffs = feats48[remaining_idx] - blocks_feats48[idx]  # (R,48)
+            scores = np.einsum('ij,ij->i', diffs, diffs)         # faster dot over axis
+            best_pos = int(np.argmin(scores))
+            best_tile = int(remaining_idx[best_pos])
+        else:
+            # rerank only ANN candidates (vectorized)
+            candidate_feats = feats48[cands]                    # (k,48)
+            diffs = candidate_feats - blocks_feats48[idx]       # (k,48)
+            scores = np.einsum('ij,ij->i', diffs, diffs)
+            best_pos = int(np.argmin(scores))
+            best_tile = int(cands[best_pos])
 
-    # Optional parallel execution
-    if max_workers > 1:
-        with ThreadPoolExecutor(max_workers=max_workers) as exe:
-            futures = [exe.submit(process_block, i) for i in range(num_blocks)]
-            for fut in as_completed(futures):
-                idx, tile_idx = fut.result()
-                selection_list[idx] = tile_idx
-                by = idx // nx
-                bx = idx % nx
-                selected_grid[by, bx] = tile_idx
-    else:
-        for i in range(num_blocks):
-            idx, tile_idx = process_block(i)
-            selection_list[idx] = tile_idx
-            by = idx // nx
-            bx = i % nx
-            selected_grid[by, bx] = tile_idx
-            if (i + 1) % 50 == 0 or i == 0:
-                print(f"  assigned block {i+1}/{num_blocks}", flush=True)
+        # assign and mark used
+        selection_list[idx] = best_tile
+        used_mask[best_tile] = True
 
+    # Now reorder selection_list back to natural block order if block_order permuted it
+    # block_order maps ordered_index -> original_index, we filled selection_list by original index (idx),
+    # so no reorder needed. If you used a separate output buffer keyed by order position, you'd reorder here.
     return selection_list
 
 
@@ -319,7 +321,7 @@ def run_pipeline(tiles_dir, source_path, out_dir, block_size=60, pca_dim=12, top
                     kept.append(pth)
             # If cache matches current tile_paths exactly, reuse
             if set(map(str, kept)) == set(map(str, tile_paths)):
-                tiles_data = [{'path': str(p), 'pil': None, 'lab': None} for p in kept]
+                tiles_data = [{'path': str(p), 'pil': None, 'pil_full': None, 'lab': None} for p in kept]
                 print(f"  cache valid: loaded {len(kept)} tile features", flush=True)
             else:
                 print("  cache contents don't match current tile set -> recomputing", flush=True)
@@ -407,16 +409,31 @@ def run_pipeline(tiles_dir, source_path, out_dir, block_size=60, pca_dim=12, top
     print("[final] Assigning tiles to blocks without repeats", flush=True)
 
     selection_list = assign_tiles_to_blocks(blocks_feats48, feats48, I, nx, ny,
-                                        top_k=top_k, redundancy_radius=3,
-                                        max_workers=8)
+                                        top_k=top_k)
+                                        # max_workers=8)
 
 
     # ---------------------------
     # Assemble final mosaic preview image with per-tile luminance adjustment
     # ---------------------------
     print("Assembling mosaic preview image with luminance adjustment...", flush=True)
-    out_w = nx * block_size
-    out_h = ny * block_size
+    # assume all tiles have same size: tx, ty
+    # safe sample tile size (works with or without cache)
+    first_tile_path = tiles_data[0].get('path')
+    if first_tile_path is None:
+        raise RuntimeError("tiles_data has no path entries")
+
+    # lazy-load a full-res sample if needed (don't rely on pil_full)
+    if tiles_data[0].get('pil_full') is None:
+        sample_img = Image.open(first_tile_path).convert('RGB')
+        tiles_data[0]['pil_full'] = sample_img  # cache the sample for reuse
+    else:
+        sample_img = tiles_data[0]['pil_full']
+
+    tx, ty = sample_img.size
+
+    out_w = nx * tx
+    out_h = ny * ty
     mosaic = Image.new('RGB', (out_w, out_h))
 
     for i, block in enumerate(blocks):
@@ -428,34 +445,11 @@ def run_pipeline(tiles_dir, source_path, out_dir, block_size=60, pca_dim=12, top
       # Load full-res tile once and cache it
       if tile_entry.get('pil_full') is None:
           tile_entry['pil_full'] = Image.open(tile_entry['path']).convert('RGB')
-      tile_img = tile_entry['pil_full']
 
-      # Resize to block size for mosaic placement
-      tile_resized = tile_img.resize((block_size, block_size), Image.LANCZOS)
-
-      # Convert to Lab for luminance adjustment
-      tile_lab = image_to_lab_arr(tile_resized)
-      block_lab = image_to_lab_arr(block['pil'])
-
-      # Adjust luminance only
-      delta_L = block_lab[:, :, 0].mean() - tile_lab[:, :, 0].mean()
-      tile_lab[:, :, 0] = np.clip(tile_lab[:, :, 0] + delta_L, 0, 100)
-
-      # Convert back to RGB
-      if HAVE_SKIMAGE:
-          with warnings.catch_warnings():
-              warnings.simplefilter("ignore")  # suppress lab2rgb clipping warnings
-              tile_adjusted = skcolor.lab2rgb(tile_lab)
-          tile_adjusted = (tile_adjusted * 255).astype(np.uint8)
-          tile_adjusted = Image.fromarray(tile_adjusted)
-      else:
-          # fallback: linear brightness scaling
-          factor = (block_lab[:, :, 0].mean() + 1e-5) / (tile_lab[:, :, 0].mean() + 1e-5)
-          tile_adjusted = np.clip(np.asarray(tile_resized, dtype=np.float32) * factor, 0, 255).astype(np.uint8)
-          tile_adjusted = Image.fromarray(tile_adjusted)
 
       # Paste adjusted tile into mosaic
-      mosaic.paste(tile_adjusted, (bx * block_size, by * block_size))
+      mosaic.paste(tile_entry['pil_full'], (bx*tx, by*ty))
+
 
       if (i + 1) % 50 == 0 or i == 0:
           print(f"  pasted block {i+1}/{len(blocks)}", flush=True)
